@@ -34,6 +34,9 @@ run_kubectl_apply_tests() {
   kube::test::get_object_assert 'pods test-pod' "{{${labels_field:?}.name}}" 'test-pod-label'
   # Post-Condition: pod "test-pod" has configuration annotation
   grep -q kubectl.kubernetes.io/last-applied-configuration <<< "$(kubectl get pods test-pod -o yaml "${kube_flags[@]:?}")"
+  # pod has field manager for kubectl client-side apply
+  output_message=$(kubectl get -f hack/testdata/pod.yaml -o=jsonpath='{.metadata.managedFields[*].manager}' "${kube_flags[@]:?}" 2>&1)
+  kube::test::if_has_string "${output_message}" 'kubectl-client-side-apply'
   # Clean up
   kubectl delete pods test-pod "${kube_flags[@]:?}"
 
@@ -98,7 +101,6 @@ run_kubectl_apply_tests() {
   kube::test::get_object_assert pods "{{range.items}}{{${id_field:?}}}:{{end}}" ''
 
   # apply dry-run
-  kubectl apply --server-dry-run -f hack/testdata/pod.yaml "${kube_flags[@]:?}"
   kubectl apply --dry-run=true -f hack/testdata/pod.yaml "${kube_flags[@]:?}"
   kubectl apply --dry-run=client -f hack/testdata/pod.yaml "${kube_flags[@]:?}"
   kubectl apply --dry-run=server -f hack/testdata/pod.yaml "${kube_flags[@]:?}"
@@ -106,10 +108,15 @@ run_kubectl_apply_tests() {
   kube::test::get_object_assert pods "{{range.items}}{{${id_field:?}}}:{{end}}" ''
   # apply non dry-run creates the pod
   kubectl apply -f hack/testdata/pod.yaml "${kube_flags[@]:?}"
+  initialResourceVersion=$(kubectl get "${kube_flags[@]:?}" -f hack/testdata/pod.yaml -o go-template='{{ .metadata.resourceVersion }}')
   # apply changes
+  kubectl apply --dry-run=client -f hack/testdata/pod-apply.yaml "${kube_flags[@]:?}"
   kubectl apply --dry-run=server -f hack/testdata/pod-apply.yaml "${kube_flags[@]:?}"
   # Post-Condition: label still has initial value
   kube::test::get_object_assert 'pods test-pod' "{{${labels_field:?}.name}}" 'test-pod-label'
+  # Ensure dry-run doesn't persist change
+  resourceVersion=$(kubectl get "${kube_flags[@]:?}" -f hack/testdata/pod.yaml -o go-template='{{ .metadata.resourceVersion }}')
+  kube::test::if_has_string "${resourceVersion}" "${initialResourceVersion}"
 
   # clean-up
   kubectl delete -f hack/testdata/pod.yaml "${kube_flags[@]:?}"
@@ -223,6 +230,30 @@ __EOF__
   # cleanup
   kubectl delete svc prune-svc 2>&1 "${kube_flags[@]:?}"
 
+  ## kubectl apply --prune can prune resources not in the defaulted namespace
+  # Pre-Condition: namespace nsb exists; no POD exists
+  kubectl create ns nsb
+  kube::test::get_object_assert pods "{{range.items}}{{${id_field:?}}}:{{end}}" ''
+  # apply a into namespace nsb
+  kubectl apply --namespace nsb -f hack/testdata/prune/a.yaml "${kube_flags[@]:?}"
+  kube::test::get_object_assert 'pods a -n nsb' "{{${id_field:?}}}" 'a'
+  # apply b with namespace
+  kubectl apply --namespace nsb -f hack/testdata/prune/b.yaml "${kube_flags[@]:?}"
+  kube::test::get_object_assert 'pods b -n nsb' "{{${id_field:?}}}" 'b'
+  # apply --prune must prune a
+  kubectl apply --prune --all -f hack/testdata/prune/b.yaml
+  # check wrong pod doesn't exist
+  output_message=$(! kubectl get pods a -n nsb 2>&1 "${kube_flags[@]:?}")
+  kube::test::if_has_string "${output_message}" 'pods "a" not found'
+  # check right pod exists
+  kube::test::get_object_assert 'pods b -n nsb' "{{${id_field:?}}}" 'b'
+
+  # cleanup
+  kubectl delete ns nsb
+
+  ## kubectl apply -n must fail if input file contains namespace other than the one given in -n
+  output_message=$(! kubectl apply -n foo -f hack/testdata/prune/b.yaml 2>&1 "${kube_flags[@]:?}")
+  kube::test::if_has_string "${output_message}" 'the namespace from the provided object "nsb" does not match the namespace "foo".'
 
   ## kubectl apply -f some.yml --force
   # Pre-condition: no service exists
@@ -261,7 +292,7 @@ __EOF__
   # Pre-Condition: namepace does not exist and no POD exists
   output_message=$(! kubectl get namespace multi-resource-ns 2>&1 "${kube_flags[@]:?}")
   kube::test::if_has_string "${output_message}" 'namespaces "multi-resource-ns" not found'
-  kube::test::get_object_assert pods "{{range.items}}{{${id_field:?}}}:{{end}}" ''
+  kube::test::wait_object_assert pods "{{range.items}}{{${id_field:?}}}:{{end}}" ''
   # First pass, namespace is created, but pod is not (since namespace does not exist yet).
   output_message=$(! kubectl apply -f hack/testdata/multi-resource-1.yaml 2>&1 "${kube_flags[@]:?}")
   kube::test::if_has_string "${output_message}" 'namespaces "multi-resource-ns" not found'
@@ -330,6 +361,13 @@ run_kubectl_server_side_apply_tests() {
   kubectl apply --server-side -f hack/testdata/pod.yaml "${kube_flags[@]:?}"
   # Post-Condition: pod "test-pod" is created
   kube::test::get_object_assert 'pods test-pod' "{{${labels_field:?}.name}}" 'test-pod-label'
+  # pod has field manager for kubectl server-side apply
+  output_message=$(kubectl get -f hack/testdata/pod.yaml -o=jsonpath='{.metadata.managedFields[*].manager}' "${kube_flags[@]:?}" 2>&1)
+  kube::test::if_has_string "${output_message}" 'kubectl'
+  # pod has custom field manager
+  kubectl apply --server-side --field-manager=my-field-manager --force-conflicts -f hack/testdata/pod.yaml "${kube_flags[@]:?}"
+  output_message=$(kubectl get -f hack/testdata/pod.yaml -o=jsonpath='{.metadata.managedFields[*].manager}' "${kube_flags[@]:?}" 2>&1)
+  kube::test::if_has_string "${output_message}" 'my-field-manager'
   # Clean up
   kubectl delete pods test-pod "${kube_flags[@]:?}"
 
@@ -343,10 +381,14 @@ run_kubectl_server_side_apply_tests() {
   kube::test::get_object_assert pods "{{range.items}}{{${id_field:?}}}:{{end}}" ''
   # apply non dry-run creates the pod
   kubectl apply --server-side -f hack/testdata/pod.yaml "${kube_flags[@]:?}"
+  initialResourceVersion=$(kubectl get "${kube_flags[@]:?}" -f hack/testdata/pod.yaml -o go-template='{{ .metadata.resourceVersion }}')
   # apply changes
   kubectl apply --server-side --dry-run=server -f hack/testdata/pod-apply.yaml "${kube_flags[@]:?}"
   # Post-Condition: label still has initial value
   kube::test::get_object_assert 'pods test-pod' "{{${labels_field:?}.name}}" 'test-pod-label'
+  # Ensure dry-run doesn't persist change
+  resourceVersion=$(kubectl get "${kube_flags[@]:?}" -f hack/testdata/pod.yaml -o go-template='{{ .metadata.resourceVersion }}')
+  kube::test::if_has_string "${resourceVersion}" "${initialResourceVersion}"
 
   # clean-up
   kubectl delete -f hack/testdata/pod.yaml "${kube_flags[@]:?}"

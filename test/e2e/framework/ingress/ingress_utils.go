@@ -37,7 +37,7 @@ import (
 	"time"
 
 	compute "google.golang.org/api/compute/v1"
-	"k8s.io/klog"
+	"k8s.io/klog/v2"
 
 	appsv1 "k8s.io/api/apps/v1"
 	v1 "k8s.io/api/core/v1"
@@ -445,10 +445,18 @@ func NewIngressTestJig(c clientset.Interface) *TestJig {
 func (j *TestJig) CreateIngress(manifestPath, ns string, ingAnnotations map[string]string, svcAnnotations map[string]string) {
 	var err error
 	read := func(file string) string {
-		return string(e2etestfiles.ReadOrDie(filepath.Join(manifestPath, file)))
+		data, err := e2etestfiles.Read(filepath.Join(manifestPath, file))
+		if err != nil {
+			framework.Fail(err.Error())
+		}
+		return string(data)
 	}
 	exists := func(file string) bool {
-		return e2etestfiles.Exists(filepath.Join(manifestPath, file))
+		found, err := e2etestfiles.Exists(filepath.Join(manifestPath, file))
+		if err != nil {
+			framework.Fail(fmt.Sprintf("fatal error looking for test file %s: %s", file, err))
+		}
+		return found
 	}
 
 	j.Logger.Infof("creating replication controller")
@@ -557,6 +565,14 @@ func (j *TestJig) runUpdate(ing *networkingv1beta1.Ingress) (*networkingv1beta1.
 	return ing, err
 }
 
+// DescribeIng describes information of ingress by running kubectl describe ing.
+func DescribeIng(ns string) {
+	framework.Logf("\nOutput of kubectl describe ing:\n")
+	desc, _ := framework.RunKubectl(
+		ns, "describe", "ing", fmt.Sprintf("--namespace=%v", ns))
+	framework.Logf(desc)
+}
+
 // Update retrieves the ingress, performs the passed function, and then updates it.
 func (j *TestJig) Update(update func(ing *networkingv1beta1.Ingress)) {
 	var err error
@@ -569,7 +585,7 @@ func (j *TestJig) Update(update func(ing *networkingv1beta1.Ingress)) {
 		update(j.Ingress)
 		j.Ingress, err = j.runUpdate(j.Ingress)
 		if err == nil {
-			framework.DescribeIng(j.Ingress.Namespace)
+			DescribeIng(j.Ingress.Namespace)
 			return
 		}
 		if !apierrors.IsConflict(err) && !apierrors.IsServerTimeout(err) {
@@ -1010,8 +1026,13 @@ func (cont *NginxIngressController) Init() {
 	framework.ExpectNoError(err)
 
 	read := func(file string) string {
-		return string(e2etestfiles.ReadOrDie(filepath.Join(IngressManifestPath, "nginx", file)))
+		data, err := e2etestfiles.Read(filepath.Join(IngressManifestPath, "nginx", file))
+		if err != nil {
+			framework.Fail(err.Error())
+		}
+		return string(data)
 	}
+
 	framework.Logf("initializing nginx ingress controller")
 	framework.RunKubectlOrDieInput(cont.Ns, read("rc.yaml"), "create", "-f", "-", fmt.Sprintf("--namespace=%v", cont.Ns))
 
